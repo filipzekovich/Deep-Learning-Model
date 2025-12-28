@@ -24,9 +24,31 @@ class_names = [
 ]
 
 
-# Load model function
+# Scratch CNN Architecture
+class ScratchCNN(nn.Module):
+    def __init__(self):
+        super(ScratchCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)  # Changed: 32 -> 16
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)  # Changed: 64 -> 32
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(32 * 7 * 7, 128)  # Changed: 64*7*7=3136 -> 32*7*7=1568
+        self.fc2 = nn.Linear(128, 10)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x):
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
+        x = x.view(-1, 32 * 7 * 7)  # Changed: 64*7*7 -> 32*7*7
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+
+# Load ConvNeXt model
 @st.cache_resource
-def load_model():
+def load_convnext_model():
     """Load the pretrained ConvNeXt model."""
     model = models.convnext_tiny(weights=None)
 
@@ -40,6 +62,21 @@ def load_model():
 
     # Load checkpoint
     checkpoint = torch.load('saved_models/baseline_convnext/checkpoint.pth', map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+
+    return model
+
+
+# Load Scratch CNN model
+@st.cache_resource
+def load_scratch_model():
+    """Load the scratch CNN model."""
+    model = ScratchCNN()
+
+    # Load checkpoint
+    checkpoint = torch.load('saved_models/scratch_cnn/checkpoint.pth', map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
@@ -89,14 +126,22 @@ class GradCAM:
 
 
 # Preprocessing function
-def preprocess_image(image):
-    """Preprocess uploaded image for model input."""
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.Grayscale(num_output_channels=3),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+def preprocess_image(image, model_type):
+    """Preprocess uploaded image based on model type."""
+    if model_type == "ConvNeXt":
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.Grayscale(num_output_channels=3),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    else:  # Scratch CNN
+        transform = transforms.Compose([
+            transforms.Resize((28, 28)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
 
     # Convert to grayscale if RGB
     if image.mode == 'RGB':
@@ -129,42 +174,98 @@ def predict_with_gradcam(model, image_tensor, grad_cam):
 # Main app
 def main():
     st.title("👕 Fashion-MNIST Classifier with Grad-CAM")
-    st.markdown("""
-    Upload a grayscale fashion item image (28×28 recommended) and the model will:
-    - Classify it into one of 10 fashion categories
-    - Show prediction confidence
-    - Generate a Grad-CAM heatmap showing which regions influenced the decision
-    """)
 
-    # Sidebar
+    # Model selection in sidebar
+    st.sidebar.header("Model Selection")
+    model_choice = st.sidebar.selectbox(
+        "Choose Model Architecture",
+        ["ConvNeXt (Transfer Learning)", "Scratch CNN"]
+    )
+
+    model_type = "ConvNeXt" if "ConvNeXt" in model_choice else "Scratch"
+
+    # Model-specific information
     st.sidebar.header("About")
-    st.sidebar.info("""
-    **Model**: ConvNeXt (tiny) pretrained on ImageNet
+    if model_type == "ConvNeXt":
+        st.sidebar.info("""
+        **Model**: ConvNeXt (tiny) pretrained on ImageNet
 
-    **Dataset**: Fashion-MNIST (10 classes)
+        **Dataset**: Fashion-MNIST (10 classes)
 
-    **Method**: Transfer Learning (Feature Extraction)
+        **Method**: Transfer Learning (Feature Extraction)
 
-    **Validation Accuracy**: ~90%
-    """)
+        **Input Size**: 224×224 RGB
+
+        **Parameters**: ~28M (frozen) + classifier
+
+        **Validation Accuracy**: ~90%
+        """)
+    else:
+        st.sidebar.info("""
+        **Model**: Custom CNN (trained from scratch)
+
+        **Dataset**: Fashion-MNIST (10 classes)
+
+        **Method**: End-to-end training
+
+        **Input Size**: 28×28 Grayscale
+
+        **Parameters**: ~250K (all trainable)
+
+        **Validation Accuracy**: ~85%
+        """)
 
     st.sidebar.header("Sample Classes")
     st.sidebar.text("\n".join([f"{i}: {name}" for i, name in enumerate(class_names)]))
 
-    # Load model
+    # Main description
+    st.markdown(f"""
+    Upload a grayscale fashion item image and the **{model_choice}** will:
+    - Classify it into one of 10 fashion categories
+    - Show prediction confidence
+    - Generate a Grad-CAM heatmap showing which regions influenced the decision
+
+    **Currently using**: {model_choice}
+    """)
+
+    # Load selected model
     try:
-        model = load_model()
-        grad_cam = GradCAM(model, model.features[-1][-1])
-        st.success("✅ Model loaded successfully!")
+        if model_type == "ConvNeXt":
+            model = load_convnext_model()
+            grad_cam = GradCAM(model, model.features[-1][-1])
+        else:
+            model = load_scratch_model()
+            grad_cam = GradCAM(model, model.conv2)
+
+        st.success(f" {model_choice} loaded successfully!")
+
+        # Display model info
+        col_info1, col_info2, col_info3 = st.columns(3)
+        with col_info1:
+            st.metric("Device", str(device).upper())
+        with col_info2:
+            input_size = "224×224 RGB" if model_type == "ConvNeXt" else "28×28 Grayscale"
+            st.metric("Input Size", input_size)
+        with col_info3:
+            params = sum(p.numel() for p in model.parameters())
+            st.metric("Parameters", f"{params:,}")
+
     except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
+        st.error(f" Error loading model: {e}")
+        st.error("Make sure the checkpoint file exists in the correct path:")
+        if model_type == "ConvNeXt":
+            st.code("saved_models/baseline_convnext/checkpoint.pth")
+        else:
+            st.code("saved_models/scratch_cnn/checkpoint.pth")
         st.stop()
+
+    st.markdown("---")
 
     # File uploader
     uploaded_file = st.file_uploader(
         "Upload a fashion item image",
         type=["png", "jpg", "jpeg"],
-        help="Upload a grayscale image of a clothing item"
+        help="Upload a grayscale or color image of a clothing item"
     )
 
     if uploaded_file is not None:
@@ -176,10 +277,12 @@ def main():
         with col1:
             st.subheader("📤 Uploaded Image")
             st.image(image, caption="Original Image", use_container_width=True)
+            st.caption(f"Image size: {image.size[0]}×{image.size[1]} pixels")
+            st.caption(f"Image mode: {image.mode}")
 
         # Preprocess and predict
-        with st.spinner("🔍 Analyzing image..."):
-            image_tensor = preprocess_image(image)
+        with st.spinner(f"🔍 Analyzing image with {model_choice}..."):
+            image_tensor = preprocess_image(image, model_type)
             pred_class, confidence, probabilities, cam = predict_with_gradcam(
                 model, image_tensor, grad_cam
             )
@@ -189,41 +292,90 @@ def main():
             st.metric("Predicted Class", class_names[pred_class])
             st.metric("Confidence", f"{confidence * 100:.2f}%")
 
+            # Confidence indicator
+            if confidence > 0.8:
+                st.success("High confidence prediction")
+            elif confidence > 0.5:
+                st.warning("Medium confidence prediction")
+            else:
+                st.error("Low confidence prediction")
+
             # Top 3 predictions
             st.markdown("**Top 3 Predictions:**")
             top3_indices = torch.topk(probabilities, 3).indices
             for i, idx in enumerate(top3_indices):
-                st.write(f"{i + 1}. {class_names[idx]}: {probabilities[idx] * 100:.2f}%")
+                prob = probabilities[idx] * 100
+                st.write(f"{i + 1}. **{class_names[idx]}**: {prob:.2f}%")
+                st.progress(int(prob))
+
+        st.markdown("---")
 
         # Grad-CAM visualization
         st.subheader("🔥 Grad-CAM Heatmap")
         st.markdown("**Red regions** indicate areas that most influenced the model's decision.")
 
-        # Create Grad-CAM overlay
-        fig, ax = plt.subplots(figsize=(6, 6))
+        col_viz1, col_viz2, col_viz3 = st.columns(3)
 
-        # Prepare image for display
-        img_np = image_tensor.squeeze().permute(1, 2, 0).cpu().numpy()
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        with col_viz1:
+            st.markdown("**Original Image**")
+            # Prepare image for display
+            img_np = image_tensor.squeeze()
+            if model_type == "ConvNeXt":
+                img_np = img_np.permute(1, 2, 0).cpu().numpy()
+            else:
+                img_np = img_np.cpu().numpy()
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
 
-        ax.imshow(img_np)
-        ax.imshow(cam, cmap="jet", alpha=0.5)
-        ax.set_title(f"Grad-CAM for '{class_names[pred_class]}'", fontsize=14, fontweight='bold')
-        ax.axis('off')
+            fig1, ax1 = plt.subplots(figsize=(5, 5))
+            if model_type == "ConvNeXt":
+                ax1.imshow(img_np)
+            else:
+                ax1.imshow(img_np, cmap='gray')
+            ax1.axis('off')
+            st.pyplot(fig1)
 
-        st.pyplot(fig)
+        with col_viz2:
+            st.markdown("**Grad-CAM Heatmap**")
+            fig2, ax2 = plt.subplots(figsize=(5, 5))
+            ax2.imshow(cam, cmap="jet")
+            ax2.axis('off')
+            st.pyplot(fig2)
+
+        with col_viz3:
+            st.markdown("**Overlay**")
+            fig3, ax3 = plt.subplots(figsize=(5, 5))
+            if model_type == "ConvNeXt":
+                ax3.imshow(img_np)
+            else:
+                ax3.imshow(img_np, cmap='gray')
+            ax3.imshow(cam, cmap="jet", alpha=0.5)
+            ax3.set_title(f"Grad-CAM for '{class_names[pred_class]}'", fontsize=12, fontweight='bold')
+            ax3.axis('off')
+            st.pyplot(fig3)
+
+        st.markdown("---")
 
         # Probability distribution
         st.subheader("📊 Class Probability Distribution")
-        fig2, ax2 = plt.subplots(figsize=(10, 5))
-        ax2.bar(class_names, probabilities.cpu().numpy(), color='steelblue', edgecolor='black')
-        ax2.set_ylabel('Probability', fontsize=12)
-        ax2.set_xlabel('Class', fontsize=12)
-        ax2.set_title('Prediction Confidence Across All Classes', fontsize=14, fontweight='bold')
-        ax2.tick_params(axis='x', rotation=45)
-        ax2.grid(axis='y', alpha=0.3)
+        fig4, ax4 = plt.subplots(figsize=(12, 5))
+        bars = ax4.bar(class_names, probabilities.cpu().numpy(), color='steelblue', edgecolor='black')
+
+        # Highlight predicted class
+        bars[pred_class].set_color('darkred')
+
+        ax4.set_ylabel('Probability', fontsize=12)
+        ax4.set_xlabel('Class', fontsize=12)
+        ax4.set_title(f'Prediction Confidence Across All Classes (Model: {model_choice})',
+                      fontsize=14, fontweight='bold')
+        ax4.tick_params(axis='x', rotation=45)
+        ax4.grid(axis='y', alpha=0.3)
+        ax4.set_ylim(0, 1)
         plt.tight_layout()
-        st.pyplot(fig2)
+        st.pyplot(fig4)
+
+        # Model comparison suggestion
+        st.info(f" **Tip**: Try switching to the other model to compare predictions! "
+                f"Currently using: **{model_choice}**")
 
 
 if __name__ == "__main__":
